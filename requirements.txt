@@ -1,6 +1,5 @@
 streamlit==1.32.0
 pandas==1.5.3
 duckdb==0.8.1
-pyarrow==12.0.0
 openpyxl
 plotly
