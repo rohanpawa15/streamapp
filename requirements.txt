@@ -3,3 +3,4 @@ pandas==1.5.3
 duckdb==0.8.1
 openpyxl
 plotly
+networkx==3.2.1
