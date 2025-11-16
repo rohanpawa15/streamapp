@@ -1,148 +1,155 @@
-# app.py
+# app.py (patched)
 import streamlit as st
 import pandas as pd
 import duckdb
-import io
 import uuid
 
 st.set_page_config(page_title="Unified Data Explorer", layout="wide")
 
 st.title("📊 Unified Data Explorer — Upload, Join & Query Multiple Files")
-st.markdown("Upload up to 5 files (CSV, Excel, JSON, Parquet). Preview tables, run SQL queries (DuckDB), or use the Join Wizard.")
 
-@st.cache_data
-def init_conn():
-    return duckdb.connect(database=':memory:')
+# Ensure a per-session duckdb connection (stored in session_state, not cached)
+if "con" not in st.session_state:
+    st.session_state.con = duckdb.connect(database=":memory:")
 
-con = init_conn()
+con = st.session_state.con
 
 def load_file_to_df(uploaded_file):
-    name = uploaded_file.name
+    # read uploaded file into a fully materialized DataFrame
+    name = uploaded_file.name.lower()
+    uploaded_file.seek(0)
     try:
-        if name.lower().endswith('.csv') or name.lower().endswith('.txt'):
+        if name.endswith(".csv") or name.endswith(".txt"):
             df = pd.read_csv(uploaded_file)
-        elif name.lower().endswith(('.xls', '.xlsx')):
+        elif name.endswith((".xls", ".xlsx")):
             df = pd.read_excel(uploaded_file)
-        elif name.lower().endswith('.json'):
-            # try json normal and json lines
+        elif name.endswith(".json"):
             try:
                 df = pd.read_json(uploaded_file)
             except ValueError:
                 uploaded_file.seek(0)
                 df = pd.read_json(uploaded_file, lines=True)
-        elif name.lower().endswith('.parquet'):
-            # requires pyarrow or fastparquet
+        elif name.endswith(".parquet"):
+            # only if pyarrow present in environment
             df = pd.read_parquet(uploaded_file)
         else:
-            st.warning(f"Unsupported file type: {name}")
+            st.warning(f"Unsupported file type: {uploaded_file.name}")
             return None
+        # Force evaluation (avoid any lazy objects)
+        df = df.copy()
         return df
     except Exception as e:
-        st.error(f"Failed to read {name}: {e}")
+        st.error(f"Failed to read {uploaded_file.name}: {e}")
         return None
 
-# Sidebar: Uploads
+# Upload UI
 st.sidebar.header("1) Upload files (max 5)")
 uploaded = st.sidebar.file_uploader(
-    "Choose files (CSV, Excel, JSON, Parquet)", type=['csv','xls','xlsx','json','parquet'], accept_multiple_files=True, help="Upload up to 5 files"
+    "Choose files (CSV, Excel, JSON, Parquet)",
+    type=["csv", "xls", "xlsx", "json", "parquet"],
+    accept_multiple_files=True,
 )
 
-# Limit to 5
-if uploaded and len(uploaded) > 5:
-    st.sidebar.error("Please upload a maximum of 5 files.")
-    uploaded = uploaded[:5]
+# Reset previous tables on new upload action (optional)
+if st.sidebar.button("Clear uploaded tables"):
+    st.session_state.pop("tables", None)
+    st.experimental_rerun()
 
-tables = {}
+# Prepare tables dictionary in session state
+if "tables" not in st.session_state:
+    st.session_state.tables = {}
+
+# Handle uploads
 if uploaded:
-    st.sidebar.markdown("**Preview uploaded files**")
+    if len(uploaded) > 5:
+        st.sidebar.error("Please upload a maximum of 5 files.")
+        uploaded = uploaded[:5]
     for f in uploaded:
+        # create stable key from filename + uuid to avoid collisions
+        base = f.name.rsplit(".", 1)[0].replace(" ", "_")[:40]
+        key = f"{base}_{str(uuid.uuid4())[:8]}"
+        # read file into dataframe
         df = load_file_to_df(f)
-        if df is not None:
-            # create a safe table name (no spaces, limited length)
-            base = f.name.rsplit('.',1)[0]
-            table_name = base.replace(' ', '_')[:40] + "_" + str(uuid.uuid4())[:8]
-            tables[table_name] = {'df': df, 'orig_name': f.name}
-            st.sidebar.write(f"**{f.name}** → registered as `{table_name}`")
-            st.sidebar.write(f"shape: {df.shape}")
-
-# If no uploads, show sample instruction
-if not tables:
-    st.info("Upload files via the left sidebar. You can try sample files or copy/paste a CSV to test.")
-else:
-    # Register tables in DuckDB
-    for tname, meta in tables.items():
-        con.register(tname, meta['df'])
-
-    # Main layout: Tabs for Preview / Join Wizard / SQL Playground
-    tab1, tab2, tab3 = st.tabs(["Table Preview", "Join Wizard", "SQL Playground"])
-
-    with tab1:
-        st.header("Table Preview")
-        for tname, meta in tables.items():
-            st.subheader(f"{meta['orig_name']}  —  `{tname}`")
-            st.write(f"Rows: {meta['df'].shape[0]} | Columns: {meta['df'].shape[1]}")
-            st.dataframe(meta['df'].head(200), use_container_width=True)
-            if st.button(f"Download `{tname}` as CSV", key=f"dl_{tname}"):
-                csv_bytes = meta['df'].to_csv(index=False).encode('utf-8')
-                st.download_button(f"Download {tname}.csv", csv_bytes, file_name=f"{tname}.csv")
-
-    with tab2:
-        st.header("Join Wizard — visually create a join between two tables")
-        table_names = list(tables.keys())
-        if len(table_names) < 2:
-            st.warning("Upload at least two tables to use the Join Wizard.")
-        else:
-            left = st.selectbox("Left table", table_names, index=0)
-            right = st.selectbox("Right table", table_names, index=1)
-            left_df = tables[left]['df']
-            right_df = tables[right]['df']
-
-            st.markdown("Select join keys (columns must exist in the respective tables).")
-            left_key = st.selectbox("Left key (column)", [""] + list(left_df.columns), index=0)
-            right_key = st.selectbox("Right key (column)", [""] + list(right_df.columns), index=0)
-            join_type = st.selectbox("Join type", ["inner", "left", "right", "outer"], index=0)
-            limit_rows = st.number_input("Preview rows", min_value=10, max_value=10000, value=200, step=10)
-
-            if st.button("Run Join"):
-                if not left_key or not right_key:
-                    st.error("Please select both join keys.")
-                else:
-                    # build SQL to avoid ambiguous column names; prefix with table aliases
-                    sql = f"""
-                    SELECT *
-                    FROM {left} AS L
-                    {join_type.upper()} JOIN {right} AS R
-                    ON L.`{left_key}` = R.`{right_key}`
-                    LIMIT {int(limit_rows)}
-                    """
-                    try:
-                        # ensure tables are registered
-                        res = con.execute(sql).df()
-                        st.success(f"Join returned {res.shape[0]} rows (showing up to {limit_rows})")
-                        st.dataframe(res)
-                        csv_bytes = res.to_csv(index=False).encode('utf-8')
-                        st.download_button("Download join result as CSV", csv_bytes, file_name="join_result.csv")
-                    except Exception as e:
-                        st.error(f"Error running join: {e}")
-
-    with tab3:
-        st.header("SQL Playground — run arbitrary SQL across registered tables")
-        st.markdown("Tables available for SQL (registered):")
-        for tname, meta in tables.items():
-            st.markdown(f"- `{tname}`  (from **{meta['orig_name']}**)")
-        st.markdown("Example: `SELECT L.*, R.other_col FROM table1 AS L JOIN table2 AS R ON L.id = R.id LIMIT 100`")
-
-        query = st.text_area("Enter SQL query", height=200, value="SELECT * FROM " + list(tables.keys())[0] + " LIMIT 200")
-        if st.button("Run SQL"):
+        if df is None:
+            continue
+        st.session_state.tables[key] = {"df": df, "orig_name": f.name}
+        # register in duckdb (re-registering on each run is fine)
+        try:
+            con.register(key, df)
+        except Exception:
+            # duckdb.register can raise if name exists; use unregister then register
             try:
-                result_df = con.execute(query).df()
-                st.success(f"Query returned {result_df.shape[0]} rows.")
-                st.dataframe(result_df)
-                csv_bytes = result_df.to_csv(index=False).encode('utf-8')
-                st.download_button("Download query result as CSV", csv_bytes, file_name="query_result.csv")
-            except Exception as e:
-                st.error(f"SQL error: {e}")
+                con.unregister(key)
+            except Exception:
+                pass
+            con.register(key, df)
 
-    # Footer / housekeeping
-    st.markdown("---")
-    st.caption("Built with Streamlit + DuckDB. Uploaded tables are kept in memory for the session only.")
+# If no tables, prompt upload
+if not st.session_state.tables:
+    st.info("Upload files via the left sidebar. You can upload CSV/Excel/JSON/Parquet.")
+    st.stop()
+
+# UI tabs
+tab1, tab2, tab3 = st.tabs(["Table Preview", "Join Wizard", "SQL Playground"])
+
+with tab1:
+    st.header("Table Preview")
+    for tname, meta in st.session_state.tables.items():
+        st.subheader(f"{meta['orig_name']}  —  `{tname}`")
+        st.write(f"Rows: {meta['df'].shape[0]} | Columns: {meta['df'].shape[1]}")
+        st.dataframe(meta["df"].head(200), use_container_width=True)
+        csv_bytes = meta["df"].to_csv(index=False).encode("utf-8")
+        st.download_button(f"Download `{tname}` as CSV", csv_bytes, file_name=f"{tname}.csv")
+
+with tab2:
+    st.header("Join Wizard — visually create a join between two tables")
+    names = list(st.session_state.tables.keys())
+    if len(names) < 2:
+        st.warning("Upload at least two tables to use the Join Wizard.")
+    else:
+        left = st.selectbox("Left table", names, index=0)
+        right = st.selectbox("Right table", names, index=1)
+        left_df = st.session_state.tables[left]["df"]
+        right_df = st.session_state.tables[right]["df"]
+
+        left_key = st.selectbox("Left key (column)", [""] + list(left_df.columns), index=0)
+        right_key = st.selectbox("Right key (column)", [""] + list(right_df.columns), index=0)
+        join_type = st.selectbox("Join type", ["inner", "left", "right", "outer"], index=0)
+        preview = st.number_input("Preview rows", min_value=10, max_value=10000, value=200, step=10)
+
+        if st.button("Run Join"):
+            if not left_key or not right_key:
+                st.error("Please select both join keys.")
+            else:
+                sql = f"""
+                SELECT *
+                FROM {left} AS L
+                {join_type.upper()} JOIN {right} AS R
+                ON L.`{left_key}` = R.`{right_key}`
+                LIMIT {int(preview)}
+                """
+                try:
+                    res = con.execute(sql).df()
+                    st.success(f"Join returned {res.shape[0]} rows (showing up to {preview})")
+                    st.dataframe(res)
+                    st.download_button("Download join result as CSV", res.to_csv(index=False).encode("utf-8"), file_name="join_result.csv")
+                except Exception as e:
+                    st.error(f"Error running join: {e}")
+
+with tab3:
+    st.header("SQL Playground")
+    st.markdown("Available tables:")
+    for k, meta in st.session_state.tables.items():
+        st.markdown(f"- `{k}` (from **{meta['orig_name']}**)")
+    default = list(st.session_state.tables.keys())[0]
+    query = st.text_area("SQL Query", value=f"SELECT * FROM {default} LIMIT 200", height=200)
+    if st.button("Run SQL"):
+        try:
+            out = con.execute(query).df()
+            st.success(f"Query returned {out.shape[0]} rows.")
+            st.dataframe(out)
+            st.download_button("Download query result as CSV", out.to_csv(index=False).encode("utf-8"), file_name="query_result.csv")
+        except Exception as e:
+            st.error(f"SQL error: {e}")
+
+st.caption("Uploaded tables live in session state and DuckDB in-memory; they are cleared when session expires.")
