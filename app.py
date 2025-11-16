@@ -1,340 +1,293 @@
-# app.py (patched)
+# app.py
 import streamlit as st
 import pandas as pd
 import duckdb
 import uuid
+import io
+import re
 
-st.set_page_config(page_title="Unified Data Explorer", layout="wide")
+st.set_page_config(page_title="Auto Join Inference", layout="wide")
+st.title("📁 Unified Data Explorer — Upload & Infer Table Joins")
 
-st.title("📊 Unified Data Explorer — Upload, Join & Query Multiple Files")
-
-# Ensure a per-session duckdb connection (stored in session_state, not cached)
+# -------------------------
+# Utility: session DB
+# -------------------------
 if "con" not in st.session_state:
     st.session_state.con = duckdb.connect(database=":memory:")
 
 con = st.session_state.con
 
-def load_file_to_df(uploaded_file):
-    # read uploaded file into a fully materialized DataFrame
-    name = uploaded_file.name.lower()
+# -------------------------
+# Robust file loader
+# -------------------------
+def robust_read_file(uploaded_file):
+    """Try multiple strategies to read an uploaded file into a pandas DataFrame."""
     uploaded_file.seek(0)
+    name = uploaded_file.name.lower()
+    # read bytes and decode safely
+    raw = uploaded_file.read()
+    # Try pandas readers with fallbacks
     try:
         if name.endswith(".csv") or name.endswith(".txt"):
-            df = pd.read_csv(uploaded_file)
-        elif name.endswith((".xls", ".xlsx")):
-            df = pd.read_excel(uploaded_file)
-        elif name.endswith(".json"):
+            # try default, then python engine skip bad lines
             try:
-                df = pd.read_json(uploaded_file)
-            except ValueError:
-                uploaded_file.seek(0)
-                df = pd.read_json(uploaded_file, lines=True)
+                return pd.read_csv(io.BytesIO(raw))
+            except Exception:
+                try:
+                    return pd.read_csv(io.BytesIO(raw), engine="python", on_bad_lines="skip")
+                except Exception:
+                    return pd.read_csv(io.BytesIO(raw), sep=",", engine="python", on_bad_lines="skip", encoding="utf-8", error_bad_lines=False)
+        elif name.endswith((".xls", ".xlsx")):
+            return pd.read_excel(io.BytesIO(raw))
+        elif name.endswith(".json"):
+            s = raw.decode("utf-8", errors="replace")
+            try:
+                return pd.read_json(io.StringIO(s))
+            except Exception:
+                try:
+                    return pd.read_json(io.StringIO(s), lines=True)
+                except Exception:
+                    # fallback: read as records
+                    import json
+                    data = json.loads(s)
+                    return pd.DataFrame(data)
         elif name.endswith(".parquet"):
-            # only if pyarrow present in environment
-            df = pd.read_parquet(uploaded_file)
+            # parquet requires pyarrow or fastparquet in environment
+            return pd.read_parquet(io.BytesIO(raw))
         else:
             st.warning(f"Unsupported file type: {uploaded_file.name}")
             return None
-        # Force evaluation (avoid any lazy objects)
-        df = df.copy()
-        return df
     except Exception as e:
-        st.error(f"Failed to read {uploaded_file.name}: {e}")
+        st.error(f"Failed to parse {uploaded_file.name}: {e}")
         return None
 
-# Upload UI
-st.sidebar.header("1) Upload files (max 5)")
-uploaded = st.sidebar.file_uploader(
-    "Choose files (CSV, Excel, JSON, Parquet)",
+# -------------------------
+# Upload UI (sidebar)
+# -------------------------
+st.sidebar.header("1) Upload up to 5 files")
+uploaded_files = st.sidebar.file_uploader(
+    "Upload CSV / Excel / JSON / Parquet",
     type=["csv", "xls", "xlsx", "json", "parquet"],
-    accept_multiple_files=True,
+    accept_multiple_files=True
 )
 
-# Reset previous tables on new upload action (optional)
+if "tables" not in st.session_state:
+    st.session_state.tables = {}  # mapping name -> {'df': df, 'orig_name': str}
+
+# Clear button
 if st.sidebar.button("Clear uploaded tables"):
-    st.session_state.pop("tables", None)
+    st.session_state.tables = {}
     st.experimental_rerun()
 
-# Prepare tables dictionary in session state
-if "tables" not in st.session_state:
-    st.session_state.tables = {}
-
-# Handle uploads
-if uploaded:
-    if len(uploaded) > 5:
-        st.sidebar.error("Please upload a maximum of 5 files.")
-        uploaded = uploaded[:5]
-    for f in uploaded:
-        # create stable key from filename + uuid to avoid collisions
-        base = f.name.rsplit(".", 1)[0].replace(" ", "_")[:40]
-        key = f"{base}_{str(uuid.uuid4())[:8]}"
-        # read file into dataframe
-        df = load_file_to_df(f)
+# handle uploads
+if uploaded_files:
+    uploaded_files = uploaded_files[:5]
+    for f in uploaded_files:
+        key_base = f.name.rsplit(".", 1)[0].replace(" ", "_")[:40]
+        key = f"{key_base}_{str(uuid.uuid4())[:6]}"
+        df = robust_read_file(f)
         if df is None:
             continue
+        # ensure df is materialized
+        df = df.copy()
         st.session_state.tables[key] = {"df": df, "orig_name": f.name}
-        # register in duckdb (re-registering on each run is fine)
+        # register in DuckDB (re-register each run)
         try:
             con.register(key, df)
         except Exception:
-            # duckdb.register can raise if name exists; use unregister then register
             try:
                 con.unregister(key)
             except Exception:
                 pass
             con.register(key, df)
 
-# If no tables, prompt upload
+# If no tables, prompt user
 if not st.session_state.tables:
-    st.info("Upload files via the left sidebar. You can upload CSV/Excel/JSON/Parquet.")
+    st.info("Upload up to 5 data files using the sidebar. Supported: CSV, Excel, JSON, Parquet (needs pyarrow).")
     st.stop()
 
-# UI tabs
-tab1, tab2, tab3 = st.tabs(["Table Preview", "Join Wizard", "SQL Playground"])
+# -------------------------
+# Small preview panel
+# -------------------------
+st.subheader("Uploaded Tables")
+cols = st.columns(3)
+i = 0
+for k, meta in st.session_state.tables.items():
+    with cols[i % 3]:
+        st.markdown(f"**{meta['orig_name']}**  —  `{k}`")
+        st.write(f"rows: {meta['df'].shape[0]} | columns: {meta['df'].shape[1]}")
+    i += 1
 
-with tab1:
-    st.header("Table Preview")
-    for tname, meta in st.session_state.tables.items():
-        st.subheader(f"{meta['orig_name']}  —  `{tname}`")
-        st.write(f"Rows: {meta['df'].shape[0]} | Columns: {meta['df'].shape[1]}")
-        st.dataframe(meta["df"].head(200), use_container_width=True)
-        csv_bytes = meta["df"].to_csv(index=False).encode("utf-8")
-        st.download_button(f"Download `{tname}` as CSV", csv_bytes, file_name=f"{tname}.csv")
+# -------------------------
+# Analyze button
+# -------------------------
+st.markdown("---")
+if st.button("🔎 Analyze tables for join relationships"):
+    st.session_state.analysis_run = True
 
-with tab2:
-    st.header("Join Wizard — visually create a join between two tables")
-    names = list(st.session_state.tables.keys())
-    if len(names) < 2:
-        st.warning("Upload at least two tables to use the Join Wizard.")
-    else:
-        left = st.selectbox("Left table", names, index=0)
-        right = st.selectbox("Right table", names, index=1)
-        left_df = st.session_state.tables[left]["df"]
-        right_df = st.session_state.tables[right]["df"]
-
-        left_key = st.selectbox("Left key (column)", [""] + list(left_df.columns), index=0)
-        right_key = st.selectbox("Right key (column)", [""] + list(right_df.columns), index=0)
-        join_type = st.selectbox("Join type", ["inner", "left", "right", "outer"], index=0)
-        preview = st.number_input("Preview rows", min_value=10, max_value=10000, value=200, step=10)
-
-        if st.button("Run Join"):
-            if not left_key or not right_key:
-                st.error("Please select both join keys.")
-            else:
-                sql = f"""
-                SELECT *
-                FROM {left} AS L
-                {join_type.upper()} JOIN {right} AS R
-                ON L.`{left_key}` = R.`{right_key}`
-                LIMIT {int(preview)}
-                """
-                try:
-                    res = con.execute(sql).df()
-                    st.success(f"Join returned {res.shape[0]} rows (showing up to {preview})")
-                    st.dataframe(res)
-                    st.download_button("Download join result as CSV", res.to_csv(index=False).encode("utf-8"), file_name="join_result.csv")
-                except Exception as e:
-                    st.error(f"Error running join: {e}")
-
-with tab3:
-    st.header("SQL Playground")
-    st.markdown("Available tables:")
-    for k, meta in st.session_state.tables.items():
-        st.markdown(f"- `{k}` (from **{meta['orig_name']}**)")
-    default = list(st.session_state.tables.keys())[0]
-    query = st.text_area("SQL Query", value=f"SELECT * FROM {default} LIMIT 200", height=200)
-    if st.button("Run SQL"):
-        try:
-            out = con.execute(query).df()
-            st.success(f"Query returned {out.shape[0]} rows.")
-            st.dataframe(out)
-            st.download_button("Download query result as CSV", out.to_csv(index=False).encode("utf-8"), file_name="query_result.csv")
-        except Exception as e:
-            st.error(f"SQL error: {e}")
-
-st.caption("Uploaded tables live in session state and DuckDB in-memory; they are cleared when session expires.")
-
-
-
-# paste near top with imports
-import re
-import math
-import networkx as nx
-import matplotlib.pyplot as plt
-
-# ---------- Utility functions ----------
-def normalize_col_name(name: str) -> str:
-    n = name.lower().strip()
+# -------------------------
+# Join inference utilities
+# -------------------------
+def normalize_col(name: str) -> str:
+    n = str(name).lower().strip()
     n = re.sub(r'[^a-z0-9]+', '_', n)
     n = re.sub(r'_{2,}', '_', n)
     return n.strip('_')
 
-def col_name_score(a: str, b: str) -> float:
-    # exact match gets 1.0, normalized match 0.9, token overlap gives partial score
+def col_name_similarity(a: str, b: str) -> float:
     if a == b:
         return 1.0
-    if normalize_col_name(a) == normalize_col_name(b):
+    if normalize_col(a) == normalize_col(b):
         return 0.9
-    toks_a = set(normalize_col_name(a).split('_'))
-    toks_b = set(normalize_col_name(b).split('_'))
-    if len(toks_a & toks_b) == 0:
+    toks_a = set(normalize_col(a).split('_'))
+    toks_b = set(normalize_col(b).split('_'))
+    if not toks_a or not toks_b:
         return 0.0
-    # partial token overlap score:
-    return 0.4 + 0.6 * (len(toks_a & toks_b) / max(len(toks_a|toks_b),1))
+    overlap = len(toks_a & toks_b)
+    union = len(toks_a | toks_b)
+    return 0.4 + 0.6 * (overlap / union) if overlap > 0 else 0.0
 
-# ---------- Core inference function ----------
-def infer_joins(tables: dict,
-                min_overlap_for_fk: float = 0.6,
-                min_confidence: float = 0.35,
-                max_candidates_per_pair: int = 3):
+def sample_distinct_values(ser: pd.Series, limit=20000):
+    ser2 = ser.dropna().astype(str)
+    if ser2.shape[0] > limit:
+        ser2 = ser2.sample(limit, random_state=1)
+    return set(ser2.unique())
+
+def infer_joins_simple(tables_dict, min_overlap=0.6, min_conf=0.35):
     """
-    tables: dict mapping table_name -> pandas.DataFrame
-    returns: list of candidate joins: {
-      left_table, right_table, left_col, right_col,
-      left_unique_pct, right_unique_pct, overlap_pct, name_score, confidence, reason, sql
-    }
+    Returns list of candidate joins sorted by confidence.
+    Each item: {left_table, right_table, left_col, right_col, overlap_pct, left_unique_pct, name_score, confidence, reason, sql}
     """
     results = []
-    names = list(tables.keys())
+    names = list(tables_dict.keys())
     for i in range(len(names)):
         for j in range(len(names)):
             if i == j:
                 continue
-            left_name = names[i]; right_name = names[j]
-            left_df = tables[left_name]
-            right_df = tables[right_name]
-            # summary stats
-            left_n = len(left_df)
-            right_n = len(right_df)
-            # avoid empty tables
-            if left_n == 0 or right_n == 0:
+            L = names[i]
+            R = names[j]
+            left_df = tables_dict[L]
+            right_df = tables_dict[R]
+            nL = len(left_df); nR = len(right_df)
+            if nL == 0 or nR == 0:
                 continue
-            # compute distinct sets (but limit memory by sampling if huge)
-            def distinct_values(df, col, sample_limit=20000):
-                ser = df[col].dropna()
-                if len(ser) > sample_limit:
-                    ser = ser.sample(sample_limit, random_state=1)
-                return set(ser.astype(str).values)
-            # iterate columns pairs
-            pair_scores = []
             for lc in left_df.columns:
                 for rc in right_df.columns:
-                    # quick type compatibility check: both numeric or both non-numeric preferred
                     try:
-                        l_ser = left_df[lc].dropna()
-                        r_ser = right_df[rc].dropna()
+                        lser = left_df[lc].dropna()
+                        rser = right_df[rc].dropna()
                     except Exception:
                         continue
-                    if l_ser.shape[0] == 0 or r_ser.shape[0] == 0:
+                    if lser.shape[0] == 0 or rser.shape[0] == 0:
                         continue
-                    # name match score
-                    name_sc = col_name_score(str(lc), str(rc))
-                    # basic dtype check
-                    l_is_num = pd.api.types.is_numeric_dtype(l_ser)
-                    r_is_num = pd.api.types.is_numeric_dtype(r_ser)
-                    if l_is_num != r_is_num:
-                        dtype_penalty = 0.7
-                    else:
-                        dtype_penalty = 1.0
-                    # uniqueness
-                    left_unique_pct = left_df[lc].nunique(dropna=True) / max(1, left_n)
-                    right_unique_pct = right_df[rc].nunique(dropna=True) / max(1, right_n)
-                    # overlap: fraction of distinct left values present in right
+                    name_sc = col_name_similarity(str(lc), str(rc))
+                    # dtype relax: treat numeric vs numeric better
+                    lnum = pd.api.types.is_numeric_dtype(lser)
+                    rnum = pd.api.types.is_numeric_dtype(rser)
+                    dtype_factor = 1.0 if lnum == rnum else 0.8
+                    left_unique = left_df[lc].nunique(dropna=True) / max(1, nL)
+                    right_unique = right_df[rc].nunique(dropna=True) / max(1, nR)
+                    # overlap sampling
                     try:
-                        left_vals = distinct_values(left_df, lc)
-                        right_vals = distinct_values(right_df, rc)
-                        if len(left_vals) == 0:
-                            overlap_pct = 0.0
-                        else:
-                            overlap_pct = len(left_vals & right_vals) / len(left_vals)
+                        left_vals = sample_distinct_values(left_df[lc])
+                        right_vals = sample_distinct_values(right_df[rc])
+                        overlap = (len(left_vals & right_vals) / len(left_vals)) if left_vals else 0.0
                     except Exception:
-                        overlap_pct = 0.0
-                    # cardinality hint: PK (left_unique_pct close to 1 and overlap large)
-                    pk_hint = 1.0 if left_unique_pct > 0.9 else max(0.0, left_unique_pct)
-                    fk_hint = 1.0 if overlap_pct >= min_overlap_for_fk else overlap_pct
-                    # size ratio adjustment (if left much larger than right, reduce score lightly)
-                    size_ratio = min(left_n, right_n) / max(left_n, right_n)
-                    # confidence formula (tunable)
-                    confidence = (0.45 * name_sc +
-                                  0.35 * fk_hint * dtype_penalty +
-                                  0.15 * pk_hint +
-                                  0.05 * size_ratio)
-                    # boost when exact name match and overlap decent
-                    if name_sc >= 0.9 and overlap_pct > 0.4:
+                        overlap = 0.0
+                    pk_hint = 1.0 if left_unique > 0.9 else left_unique
+                    fk_hint = 1.0 if overlap >= min_overlap else overlap
+                    size_ratio = min(nL, nR) / max(nL, nR)
+                    confidence = (0.45 * name_sc + 0.35 * fk_hint * dtype_factor + 0.15 * pk_hint + 0.05 * size_ratio)
+                    if name_sc >= 0.9 and overlap > 0.4:
                         confidence = min(1.0, confidence + 0.08)
-                    # reason text
                     reason_parts = []
                     if name_sc >= 0.9:
                         reason_parts.append("column names match")
                     elif name_sc > 0.4:
-                        reason_parts.append("partial name similarity")
-                    if overlap_pct > 0:
-                        reason_parts.append(f"{overlap_pct:.0%} of left values found in right")
-                    if left_unique_pct > 0.9:
-                        reason_parts.append("left column looks unique (pk candidate)")
-                    # build SQL sample
-                    sql = f"SELECT L.*, R.* FROM \"{left_name}\" AS L JOIN \"{right_name}\" AS R ON L.\"{lc}\" = R.\"{rc}\" LIMIT 100"
-                    pair_scores.append({
-                        "left_table": left_name, "right_table": right_name,
+                        reason_parts.append("name similarity")
+                    if overlap > 0:
+                        reason_parts.append(f"{overlap:.0%} left values in right")
+                    if left_unique > 0.9:
+                        reason_parts.append("left column looks unique (PK candidate)")
+                    sql = f'SELECT L.*, R.* FROM "{L}" AS L JOIN "{R}" AS R ON L."{lc}" = R."{rc}" LIMIT 100'
+                    results.append({
+                        "left_table": L, "right_table": R,
                         "left_col": lc, "right_col": rc,
-                        "left_unique_pct": left_unique_pct,
-                        "right_unique_pct": right_unique_pct,
-                        "overlap_pct": overlap_pct,
+                        "overlap_pct": overlap,
+                        "left_unique_pct": left_unique,
+                        "right_unique_pct": right_unique,
                         "name_score": name_sc,
                         "confidence": confidence,
                         "reason": "; ".join(reason_parts) if reason_parts else "value overlap",
                         "sql": sql
                     })
-            # pick top candidates for this pair
-            pair_scores.sort(key=lambda x: x["confidence"], reverse=True)
-            for cand in pair_scores[:max_candidates_per_pair]:
-                if cand["confidence"] >= min_confidence:
-                    results.append(cand)
-    # sort global results
+    # filter & sort
+    results = [r for r in results if r["confidence"] >= min_conf]
     results.sort(key=lambda x: x["confidence"], reverse=True)
     return results
 
-# ---------- Streamlit UI integration ----------
-def show_join_suggestions(tables):
-    st.header("🔗 Suggested Joins & Data Model")
-    preds = infer_joins(tables)
-    if not preds:
-        st.info("No strong join candidates found automatically. Consider manual join keys.")
-        return
-    # show top suggestions grouped by table pair
-    grouped = {}
-    for p in preds:
-        key = (p["left_table"], p["right_table"])
-        grouped.setdefault(key, []).append(p)
-    for (lt, rt), items in grouped.items():
-        st.subheader(f"{lt}  ↔  {rt}")
-        for it in items:
-            st.markdown(f"- **{it['left_col']}** → **{it['right_col']}**  —  Confidence: **{it['confidence']:.2f}**  \n  _{it['reason']}_")
-            cols = st.columns([3,1])
-            with cols[0]:
-                st.code(it['sql'], language='sql')
-            with cols[1]:
-                if st.button(f"Use join {lt}.{it['left_col']} → {rt}.{it['right_col']}", key=f"use_{lt}_{rt}_{it['left_col']}_{it['right_col']}"):
-                    # run sample join and show result
-                    try:
-                        df = st.session_state.con.execute(it['sql']).df()
-                        st.write(df.head(200))
-                    except Exception as e:
-                        st.error(f"Error executing sample join: {e}")
-    # graph visualization
-    if st.checkbox("Show relationship graph"):
-        G = nx.DiGraph()
-        for t in tables.keys():
-            G.add_node(t)
-        for p in preds:
-            if p['confidence'] > 0.35:
-                G.add_edge(p['left_table'], p['right_table'], label=f"{p['left_col']}→{p['right_col']}", weight=p['confidence'])
-        plt.figure(figsize=(8,6))
-        pos = nx.spring_layout(G, seed=2)
-        nx.draw(G, pos, with_labels=True, node_size=1600, node_color="#9fb3ff", font_size=10, arrows=True)
-        # draw edge labels
-        edge_labels = {(u,v): d['label'] for u,v,d in G.edges(data=True)}
-        nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_color='gray', font_size=8)
-        st.pyplot(plt)
+# -------------------------
+# Run analysis if requested
+# -------------------------
+if st.session_state.get("analysis_run", False):
+    st.markdown("## 🔗 Suggested Joins & Data Model (inferred)")
+    # normalize tables dict: name -> DataFrame
+    simple_tables = {k: v["df"] if isinstance(v, dict) and "df" in v else v for k, v in st.session_state.tables.items()}
+    if len(simple_tables) < 2:
+        st.info("Upload at least 2 tables to infer joins.")
+    else:
+        # reduce thresholds for initial visibility, user can tweak later
+        candidates = infer_joins_simple(simple_tables, min_overlap=0.25, min_conf=0.20)
+        if not candidates:
+            st.info("No confident joins found. Try lowering thresholds or inspect column names and values.")
+            # show debug hint
+            st.write("Tables analyzed:")
+            for n, df in simple_tables.items():
+                st.write(f"- `{n}`: rows={df.shape[0]}, cols={list(df.columns)[:10]}")
+        else:
+            # group by table pairs
+            grouped = {}
+            for c in candidates:
+                key = (c["left_table"], c["right_table"])
+                grouped.setdefault(key, []).append(c)
+            for (L, R), items in grouped.items():
+                st.subheader(f"{L}  ↔  {R}")
+                for it in items:
+                    st.markdown(f"- **{it['left_col']}** → **{it['right_col']}** — Confidence **{it['confidence']:.2f}**  \n  _{it['reason']}_")
+                    cols = st.columns([3,1])
+                    with cols[0]:
+                        st.code(it["sql"], language="sql")
+                    with cols[1]:
+                        if st.button(f"Preview {L}.{it['left_col']} → {R}.{it['right_col']}", key=f"pv_{L}_{R}_{it['left_col']}_{it['right_col']}"):
+                            try:
+                                df_preview = con.execute(it["sql"]).df()
+                                st.dataframe(df_preview.head(200))
+                                st.download_button("Download preview CSV", df_preview.to_csv(index=False).encode("utf-8"), file_name="join_preview.csv")
+                            except Exception as e:
+                                st.error(f"Preview failed: {e}")
 
+            # optional graph (only if networkx available)
+            try:
+                import networkx as nx
+                import matplotlib.pyplot as plt
+                G = nx.DiGraph()
+                for t in simple_tables.keys():
+                    G.add_node(t)
+                for c in candidates:
+                    if c["confidence"] > 0.25:
+                        G.add_edge(c["left_table"], c["right_table"], label=f"{c['left_col']}→{c['right_col']}", weight=c["confidence"])
+                plt.figure(figsize=(8, 6))
+                pos = nx.spring_layout(G, seed=2)
+                nx.draw(G, pos, with_labels=True, node_size=1400, node_color="#9fb3ff", font_size=10, arrows=True)
+                edge_labels = {(u, v): d["label"] for u, v, d in G.edges(data=True)}
+                nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_color="gray", font_size=8)
+                st.pyplot(plt)
+            except Exception:
+                st.info("Graph visualization disabled (install networkx + matplotlib to enable).")
 
+    # reset flag so user can re-run if needed
+    st.session_state.analysis_run = False
+
+# End
+st.markdown("---")
+st.caption("Notes: inference uses heuristic rules (name similarity, value overlap, uniqueness). Adjust thresholds for sensitivity.")
