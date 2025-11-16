@@ -337,16 +337,4 @@ def show_join_suggestions(tables):
         nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_color='gray', font_size=8)
         st.pyplot(plt)
 
-st.write("DEBUG: session keys:", list(st.session_state.keys()))
-if "tables" in st.session_state:
-    st.write("DEBUG: tables keys:", list(st.session_state.tables.keys()))
-    for k, v in st.session_state.tables.items():
-        if isinstance(v, dict) and 'df' in v:
-            st.write(k, "=> df shape:", v['df'].shape)
-        elif hasattr(v, 'shape'):
-            st.write(k, "=> df shape:", v.shape)
-        else:
-            st.write(k, "=> type:", type(v))
-else:
-    st.write("DEBUG: No tables in session_state")
 
